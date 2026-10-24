@@ -1,171 +1,357 @@
-name: Fork APK release
+name: Build and publish customized Lawnchair
 
 on:
   push:
-    branches: [private-space-release]
+    branches: [master]
+  schedule:
+    - cron: '19 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: lawnchair-fork-release
+  cancel-in-progress: false
 
 permissions: {}
 
 jobs:
-  sync-upstream:
+  resolve-source:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      issues: write
     outputs:
-      source_sha: ${{ steps.sync.outputs.source_sha }}
+      skip: ${{ steps.resolve.outputs.skip }}
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      upstream_tag: ${{ steps.resolve.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.resolve.outputs.upstream_sha }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      version_name: ${{ steps.resolve.outputs.version_name }}
+      version_code: ${{ steps.resolve.outputs.version_code }}
+      release_exists: ${{ steps.resolve.outputs.release_exists }}
+      upstream_prerelease: ${{ steps.resolve.outputs.upstream_prerelease }}
+      upstream_body_b64: ${{ steps.resolve.outputs.upstream_body_b64 }}
+      local_commits_b64: ${{ steps.resolve.outputs.local_commits_b64 }}
+      features_b64: ${{ steps.resolve.outputs.features_b64 }}
+      baseline_b64: ${{ steps.resolve.outputs.baseline_b64 }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Check out the triggering source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v4
         with:
-          ref: private-space-release
+          ref: ${{ github.event_name == 'push' && github.sha || 'master' }}
           fetch-depth: 0
-      - name: Merge Lawnchair 15 beta upstream
-        id: sync
+
+      - name: Resolve source, upstream release notes, and stable release identity
+        id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          UPSTREAM_REPOSITORY: LawnchairLauncher/lawnchair
+        shell: bash
         run: |
           set -euo pipefail
-          git remote add upstream https://github.com/LawnchairLauncher/lawnchair.git
-          git fetch upstream 15-beta
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if ! git merge --no-edit FETCH_HEAD; then
-            git merge --abort || true
-            title="Lawnchair upstream sync conflict"
-            exists=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --json title --jq 'map(.title) | index("'"$title"'") != null')
-            if [ "$exists" != "true" ]; then
-              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "The automated merge from LawnchairLauncher/lawnchair 15-beta conflicted. No APK was built or published. Resolve the conflict on branch private-space-release, then push a new commit to retry. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch upstream '+refs/heads/*:refs/remotes/upstream/*' '+refs/tags/*:refs/tags/upstream/*'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if [[ "$EVENT_NAME" == 'push' ]]; then
+            branch_sha="$(git ls-remote origin refs/heads/master | awk 'NR == 1 {print $1}')"
+            if [[ -n "$branch_sha" && "$branch_sha" != "$(git rev-parse HEAD)" ]] && git merge-base --is-ancestor HEAD "$branch_sha"; then
+              echo 'skip=true' >> "$GITHUB_OUTPUT"
+              exit 0
             fi
-            exit 1
           fi
-          if ! git diff --quiet "origin/private-space-release" HEAD; then
-            git push origin HEAD:private-space-release
+          baseline="$(tr -d '\r\n' < .github/upstream-release-tag)"
+          pending_file=.github/pending-upstream-release.json
+          upstream_tag="$baseline"
+          upstream_sha="$(git rev-parse "refs/tags/upstream/${baseline}^{commit}")"
+          upstream_body=''
+          upstream_prerelease=false
+
+          if [[ "$EVENT_NAME" == 'schedule' ]]; then
+            api_result="$(curl --silent --show-error -w '\n%{http_code}' "https://api.github.com/repos/${UPSTREAM_REPOSITORY}/releases?per_page=100")"
+            api_status="${api_result##*$'\n'}"
+            upstream_releases="${api_result%$'\n'*}"
+            [[ "$api_status" == '200' ]] || { echo "Upstream release listing failed with HTTP ${api_status}." >&2; exit 1; }
+            printf '%s' "$upstream_releases" > "$RUNNER_TEMP/upstream-releases.json"
+            python3 - "$RUNNER_TEMP/upstream-releases.json" "$RUNNER_TEMP/upstream-candidates.json" <<'PY'
+          import json, subprocess, sys
+          from pathlib import Path
+          values = []
+          for release in json.loads(Path(sys.argv[1]).read_text()):
+              tag = release.get('tag_name', '')
+              if release.get('draft') or 'nightly' in tag.lower():
+                  continue
+              if subprocess.run(['git', 'rev-parse', '--verify', f'refs/tags/upstream/{tag}^{{commit}}'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+                  continue
+              values.append({'tag_name': tag, 'body': release.get('body') or f'No upstream release notes were provided for {tag}.', 'prerelease': bool(release.get('prerelease'))})
+          Path(sys.argv[2]).write_text(json.dumps(values, ensure_ascii=False))
+          PY
+            selection="$(python3 .github/scripts/resolve_upstream_release.py --baseline "$baseline" --candidates "$RUNNER_TEMP/upstream-candidates.json")"
+            printf '%s' "$selection" > "$RUNNER_TEMP/upstream-selection.json"
+            chosen="$(jq -c '.selected // empty' <<<"$selection")"
+            decision="$(python3 - "$EVENT_NAME" "$selection" "$pending_file" <<'PY'
+          import json, sys
+          from pathlib import Path
+          sys.path.insert(0, '.github/scripts')
+          from resolve_upstream_release import schedule_action
+          print(schedule_action(sys.argv[1], json.loads(sys.argv[2]), Path(sys.argv[3]).exists()))
+          PY
+          )"
+            if [[ "$decision" == 'skip-no-change' ]]; then
+              echo 'skip=true' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [[ -n "$chosen" ]]; then
+              upstream_tag="$(jq -r '.tag_name' <<<"$chosen")"
+              upstream_sha="$(git rev-parse "refs/tags/upstream/${upstream_tag}^{commit}")"
+              upstream_prerelease="$(jq -r '.prerelease' <<<"$chosen")"
+              pending_notes_file="$RUNNER_TEMP/pending-upstream-notes.md"
+              : > "$pending_notes_file"
+              if [[ -f "$pending_file" ]]; then
+                prior_result="$(curl --silent --show-error -w '\n%{http_code}' -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+                prior_status="${prior_result##*$'\n'}"
+                prior_json="${prior_result%$'\n'*}"
+                [[ "$prior_status" == '200' ]] || { echo "Fork release listing failed with HTTP ${prior_status}; refusing to advance pending upstream notes." >&2; exit 1; }
+                printf '%s' "$prior_json" > "$RUNNER_TEMP/prior-fork-releases.json"
+                python3 - "$pending_file" "$RUNNER_TEMP/prior-fork-releases.json" "$pending_notes_file" <<'PY'
+          import json, sys
+          from pathlib import Path
+          sys.path.insert(0, '.github/scripts')
+          from resolve_upstream_release import unpublished_pending_notes
+          pending = json.loads(Path(sys.argv[1]).read_text())
+          releases = json.loads(Path(sys.argv[2]).read_text())
+          Path(sys.argv[3]).write_text(unpublished_pending_notes(pending, releases, 'lawnchair-fork.apk'))
+          PY
+              fi
+              upstream_body="$(python3 - "$RUNNER_TEMP/upstream-selection.json" "$pending_notes_file" <<'PY'
+          import json, sys
+          from pathlib import Path
+          sys.path.insert(0, '.github/scripts')
+          from resolve_upstream_release import aggregate_release_notes
+          pending = Path(sys.argv[2]).read_text() if Path(sys.argv[2]).exists() else ''
+          selection = json.loads(Path(sys.argv[1]).read_text())
+          print(aggregate_release_notes(pending, selection['incorporated']), end='')
+          PY
+          )"
+              python3 - "$pending_file" "$upstream_tag" "$upstream_body" "$upstream_prerelease" <<'PY'
+          import json, sys
+          from pathlib import Path
+          Path(sys.argv[1]).write_text(json.dumps({'tag': sys.argv[2], 'body': sys.argv[3], 'prerelease': sys.argv[4] == 'true'}, ensure_ascii=False) + '\n')
+          PY
+              git merge --no-edit "$upstream_sha"
+              printf '%s\n' "$upstream_tag" > .github/upstream-release-tag
+              git add .github/upstream-release-tag "$pending_file"
+              git commit -m "chore: integrate upstream release ${upstream_tag}"
+              git push origin HEAD:refs/heads/master
+            elif [[ -f "$pending_file" ]]; then
+              upstream_tag="$(jq -r '.tag' "$pending_file")"
+              upstream_sha="$(git rev-parse "refs/tags/upstream/${upstream_tag}^{commit}")"
+              upstream_body="$(jq -r '.body' "$pending_file")"
+              upstream_prerelease="$(jq -r '.prerelease' "$pending_file")"
+            else
+              echo 'skip=true' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          elif [[ -f "$pending_file" ]]; then
+            upstream_tag="$(jq -r '.tag' "$pending_file")"
+            upstream_sha="$(git rev-parse "refs/tags/upstream/${upstream_tag}^{commit}")"
+            upstream_body="$(jq -r '.body' "$pending_file")"
+            upstream_prerelease="$(jq -r '.prerelease' "$pending_file")"
+          else
+            [[ "$upstream_tag" == *beta* || "$upstream_tag" == *alpha* || "$upstream_tag" == *rc* ]] && upstream_prerelease=true
+            upstream_body="The fork master source is based on upstream release ${upstream_tag}."
           fi
-          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+          source_sha="$(git rev-parse HEAD)"
+          releases_result="$(curl --silent --show-error -w '\n%{http_code}' -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+          releases_status="${releases_result##*$'\n'}"
+          releases_json="${releases_result%$'\n'*}"
+          [[ "$releases_status" == '200' ]] || { echo "Fork release listing failed with HTTP ${releases_status}." >&2; exit 1; }
+          printf '%s' "$releases_json" > "$RUNNER_TEMP/releases.json"
+          existing="$(python3 - "$source_sha" "$RUNNER_TEMP/releases.json" <<'PY'
+          import json, sys
+          from pathlib import Path
+          sys.path.insert(0, '.github/scripts')
+          from resolve_upstream_release import find_source_release
+          match = find_source_release(json.loads(Path(sys.argv[2]).read_text()), sys.argv[1], 'lawnchair-fork.apk')
+          print(json.dumps(match) if match else '')
+          PY
+          )"
+          if [[ -n "$existing" && "$(jq -r '.asset_present' <<<"$existing")" == 'true' ]]; then
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          release_exists=false
+          if [[ -n "$existing" ]]; then
+            release_exists=true
+            release_tag="$(jq -r '.tag_name' <<<"$existing")"
+            version_name="${release_tag#v}"
+            version_code="$(jq -r '.body' <<<"$existing" | sed -n 's/^Android versionCode: \([0-9]*\)$/\1/p' | head -n1)"
+            [[ -n "$version_code" ]] || { echo 'Existing release lacks Android versionCode metadata.' >&2; exit 1; }
+          else
+            version_label="${upstream_tag#v}"
+            versions="$(python3 - "$RUNNER_TEMP/releases.json" "$GITHUB_RUN_NUMBER" <<'PY'
+          import json, sys
+          from pathlib import Path
+          sys.path.insert(0, '.github/scripts')
+          from resolve_upstream_release import next_release_versions
+          releases = json.loads(Path(sys.argv[1]).read_text())
+          serial, code = next_release_versions(1600000000, int(sys.argv[2]), releases)
+          print(f'{serial} {code}')
+          PY
+          )"
+            read -r serial version_code <<<"$versions"
+            version_name="${version_label}-fork.${serial}"
+            release_tag="v${version_name}"
+          fi
+          if [[ -z "$existing" ]]; then
+            previous="$(python3 - "$RUNNER_TEMP/releases.json" <<'PY'
+          import json, sys
+          from pathlib import Path
+          releases = json.loads(Path(sys.argv[1]).read_text())
+          valid = [r for r in releases if not r.get('draft') and r.get('tag_name', '').startswith('v') and '-fork.' in r.get('tag_name', '') and any(a.get('name') == 'lawnchair-fork.apk' for a in (r.get('assets') or []))]
+          valid.sort(key=lambda r: r.get('published_at') or '')
+          print(valid[-1].get('tag_name', '') if valid else '')
+          PY
+          )"
+            mapfile -t upstream_tag_refs < <(git for-each-ref --format='%(refname)' refs/tags/upstream)
+            if [[ -n "$previous" ]] && git rev-parse --verify "refs/tags/${previous}^{commit}" >/dev/null 2>&1; then
+              local_commits="$(git log --no-merges --format='- %s (%h)' "${previous}..${source_sha}" --not --remotes=upstream "${upstream_tag_refs[@]}")"
+            else
+              local_commits="$(git log --no-merges --format='- %s (%h)' "$source_sha" --not --remotes=upstream "${upstream_tag_refs[@]}")"
+            fi
+          else
+            local_commits='Release asset retry; source and notes remain those of the existing release.'
+          fi
+          [[ -n "$local_commits" ]] || local_commits='No new fork-only commits since the previous release.'
+          features="$(cat .github/fork-release-features.md)"
+          baseline_notes="$(cat .github/release-baseline.md)"
+          printf 'skip=false\nsource_sha=%s\nupstream_tag=%s\nupstream_sha=%s\nrelease_tag=%s\nversion_name=%s\nversion_code=%s\nrelease_exists=%s\nupstream_prerelease=%s\n' "$source_sha" "$upstream_tag" "$upstream_sha" "$release_tag" "$version_name" "$version_code" "$release_exists" "$upstream_prerelease" >> "$GITHUB_OUTPUT"
+          printf 'upstream_body_b64=%s\nlocal_commits_b64=%s\nfeatures_b64=%s\nbaseline_b64=%s\n' "$(printf '%s' "$upstream_body" | base64 -w0)" "$(printf '%s' "$local_commits" | base64 -w0)" "$(printf '%s' "$features" | base64 -w0)" "$(printf '%s' "$baseline_notes" | base64 -w0)" >> "$GITHUB_OUTPUT"
 
   build-unsigned:
-    needs: sync-upstream
+    needs: resolve-source
+    if: needs.resolve-source.outputs.skip != 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Check out the immutable release source and submodules
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v4
         with:
-          ref: ${{ needs.sync-upstream.outputs.source_sha }}
-          submodules: true
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
+          fetch-depth: 0
+          submodules: recursive
           persist-credentials: false
-      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+      - name: Set up Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
         with:
           distribution: zulu
-          java-version: 21
+          java-version: '21'
       - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c
-      - name: Build unsigned GitHub release APK
+      - name: Build unsigned APK from immutable source
         env:
-          LAWNCHAIR_UNSIGNED_RELEASE: "true"
-        run: ./gradlew --no-daemon assembleLawnWithQuickstepGithubRelease
-      - name: Verify the APK is unsigned and is the GitHub flavor
+          SOURCE_SHA: ${{ needs.resolve-source.outputs.source_sha }}
+          LAWNCHAIR_UNSIGNED_RELEASE: 'true'
+          LAWNCHAIR_FORK_VERSION_NAME: ${{ needs.resolve-source.outputs.version_name }}
+          LAWNCHAIR_FORK_VERSION_CODE: ${{ needs.resolve-source.outputs.version_code }}
         run: |
           set -euo pipefail
-          apk=$(find build/outputs/apk/lawnWithQuickstepGithub/release -maxdepth 1 -name '*.apk' -print -quit)
-          test -n "$apk"
-          if apksigner verify "$apk" >/dev/null 2>&1; then
-            echo "The build job produced a signed APK" >&2
-            exit 1
-          fi
-          sdk_root=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}
-          apkanalyzer=$(find "$sdk_root" -type f -name apkanalyzer -print -quit)
-          test -x "$apkanalyzer"
-          app_id=$("$apkanalyzer" manifest application-id "$apk")
-          test "$app_id" = "app.lawnchair"
-          mkdir -p "$RUNNER_TEMP/release"
-          cp "$apk" "$RUNNER_TEMP/release/lawnchair-github-unsigned.apk"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          ./gradlew --no-daemon assembleLawnWithQuickstepGithubRelease
+      - name: Verify unsigned artifact identity and metadata
+        env:
+          EXPECTED_VERSION_NAME: ${{ needs.resolve-source.outputs.version_name }}
+          EXPECTED_VERSION_CODE: ${{ needs.resolve-source.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          apk="$(find build/outputs/apk/lawnWithQuickstepGithub/release -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -s "$apk"
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          signer="$(find "$sdk_root/build-tools" -type f -name apksigner | sort -V | tail -n1)"
+          analyzer="$(find "$sdk_root" -type f -name apkanalyzer -print -quit)"
+          if "$signer" verify "$apk" >/dev/null 2>&1; then echo 'Expected unsigned APK.' >&2; exit 1; fi
+          test "$("$analyzer" manifest application-id "$apk")" = 'app.lawnchair'
+          test "$("$analyzer" manifest version-name "$apk")" = "$EXPECTED_VERSION_NAME"
+          test "$("$analyzer" manifest version-code "$apk")" = "$EXPECTED_VERSION_CODE"
+          cp "$apk" "$RUNNER_TEMP/lawnchair-unsigned.apk"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: lawnchair-unsigned
-          path: ${{ runner.temp }}/release/lawnchair-github-unsigned.apk
+          path: ${{ runner.temp }}/lawnchair-unsigned.apk
           if-no-files-found: error
           retention-days: 1
 
-  sign-apk:
-    needs: [sync-upstream, build-unsigned]
+  sign-and-publish:
+    needs: [resolve-source, build-unsigned]
+    if: needs.resolve-source.outputs.skip != 'true'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
     steps:
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: lawnchair-unsigned
           path: ${{ runner.temp }}/unsigned
-      - name: Sign and verify the APK
+      - name: Sign and verify APK
         env:
           KEYSTORE_BASE64: ${{ secrets.LAWNCHAIR_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.LAWNCHAIR_KEYSTORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.LAWNCHAIR_KEY_PASSWORD }}
-          KEY_ALIAS: lawnchair-release
+        shell: bash
         run: |
           set -euo pipefail
-          sdk_root=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}
-          apk=$(find "$sdk_root/build-tools" -type f -name apksigner | sort -V | tail -n 1)
-          apkanalyzer=$(find "$sdk_root" -type f -name apkanalyzer -print -quit)
-          test -x "$apk"
-          test -x "$apkanalyzer"
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/lawnchair-release.jks"
-          chmod 600 "$RUNNER_TEMP/lawnchair-release.jks"
-          "$apk" sign --ks "$RUNNER_TEMP/lawnchair-release.jks" \
-            --ks-key-alias "$KEY_ALIAS" \
-            --ks-pass env:KEYSTORE_PASSWORD --key-pass env:KEY_PASSWORD \
-            --out "$RUNNER_TEMP/lawnchair-github.apk" \
-            "$RUNNER_TEMP/unsigned/lawnchair-github-unsigned.apk"
-          "$apk" verify --verbose --print-certs "$RUNNER_TEMP/lawnchair-github.apk"
-          app_id=$("$apkanalyzer" manifest application-id "$RUNNER_TEMP/lawnchair-github.apk")
-          test "$app_id" = "app.lawnchair"
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
-        with:
-          name: lawnchair-signed
-          path: ${{ runner.temp }}/lawnchair-github.apk
-          if-no-files-found: error
-          retention-days: 1
-
-  publish-release:
-    needs: [sync-upstream, sign-apk]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
-        with:
-          name: lawnchair-signed
-          path: ${{ runner.temp }}/release
-      - name: Publish GitHub release
+          : "${KEYSTORE_BASE64:?Missing LAWNCHAIR_KEYSTORE_BASE64 secret}"
+          : "${KEYSTORE_PASSWORD:?Missing LAWNCHAIR_KEYSTORE_PASSWORD secret}"
+          : "${KEY_PASSWORD:?Missing LAWNCHAIR_KEY_PASSWORD secret}"
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          signer="$(find "$sdk_root/build-tools" -type f -name apksigner | sort -V | tail -n1)"
+          analyzer="$(find "$sdk_root" -type f -name apkanalyzer -print -quit)"
+          key="$RUNNER_TEMP/lawnchair-release.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$key"
+          chmod 600 "$key"
+          "$signer" sign --ks "$key" --ks-key-alias lawnchair-release --ks-pass env:KEYSTORE_PASSWORD --key-pass env:KEY_PASSWORD --out "$RUNNER_TEMP/lawnchair-fork.apk" "$RUNNER_TEMP/unsigned/lawnchair-unsigned.apk"
+          "$signer" verify --verbose "$RUNNER_TEMP/lawnchair-fork.apk"
+          test "$("$analyzer" manifest application-id "$RUNNER_TEMP/lawnchair-fork.apk")" = 'app.lawnchair'
+      - name: Publish release notes and APK
         env:
           GH_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ needs.sync-upstream.outputs.source_sha }}
-          RUN_NUMBER: ${{ github.run_number }}
+          RELEASE_EXISTS: ${{ needs.resolve-source.outputs.release_exists }}
+          RELEASE_TAG: ${{ needs.resolve-source.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.resolve-source.outputs.source_sha }}
+          UPSTREAM_TAG: ${{ needs.resolve-source.outputs.upstream_tag }}
+          UPSTREAM_SHA: ${{ needs.resolve-source.outputs.upstream_sha }}
+          VERSION_NAME: ${{ needs.resolve-source.outputs.version_name }}
+          VERSION_CODE: ${{ needs.resolve-source.outputs.version_code }}
+          UPSTREAM_PRERELEASE: ${{ needs.resolve-source.outputs.upstream_prerelease }}
+          UPSTREAM_BODY_B64: ${{ needs.resolve-source.outputs.upstream_body_b64 }}
+          LOCAL_COMMITS_B64: ${{ needs.resolve-source.outputs.local_commits_b64 }}
+          FEATURES_B64: ${{ needs.resolve-source.outputs.features_b64 }}
+          BASELINE_B64: ${{ needs.resolve-source.outputs.baseline_b64 }}
+        shell: bash
         run: |
           set -euo pipefail
-          short_sha=${SOURCE_SHA:0:7}
-          tag="lawnchair-15beta-private-${short_sha}-${RUN_NUMBER}"
-          title="Lawnchair GitHub release with Private Space changes (${short_sha})"
-          gh release create "$tag" "$RUNNER_TEMP/release/lawnchair-github.apk" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$SOURCE_SHA" \
-            --title "$title" \
-            --notes "Lawnchair GitHub flavor, Release build. Includes the Private Space changes from this fork. Package ID: app.lawnchair. Source commit: ${SOURCE_SHA}."
-
-  notify-failure:
-    if: always() && contains(join(needs.*.result, ','), 'failure')
-    needs: [sync-upstream, build-unsigned, sign-apk, publish-release]
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-    steps:
-      - name: Open a failure issue without exposing secrets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          title="Lawnchair APK release workflow failed"
-          exists=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --json title --jq 'map(.title) | index("'"$title"'") != null')
-          if [ "$exists" != "true" ]; then
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "The unsigned build, signing verification, upstream sync, or release publication failed. No signing credentials are included in this issue. Inspect the failed run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          printf '%s' "$UPSTREAM_BODY_B64" | base64 --decode > "$RUNNER_TEMP/upstream-notes.md"
+          printf '%s' "$LOCAL_COMMITS_B64" | base64 --decode > "$RUNNER_TEMP/local-commits.md"
+          printf '%s' "$FEATURES_B64" | base64 --decode > "$RUNNER_TEMP/features.md"
+          printf '%s' "$BASELINE_B64" | base64 --decode > "$RUNNER_TEMP/baseline.md"
+          {
+            printf 'Customized Lawnchair fork build.\n\nFork source commit: `%s`\n\n' "$SOURCE_SHA"
+            printf 'Upstream release: [%s](https://github.com/LawnchairLauncher/lawnchair/releases/tag/%s) at `%s`.\n\n' "$UPSTREAM_TAG" "$UPSTREAM_TAG" "$UPSTREAM_SHA"
+            printf 'Android version: `%s` (versionCode %s).\nAndroid versionCode: %s\n\n## Upstream changelog\n\n' "$VERSION_NAME" "$VERSION_CODE" "$VERSION_CODE"
+            cat "$RUNNER_TEMP/upstream-notes.md"
+            printf '\n\n## Fork changes since previous release\n\n'
+            cat "$RUNNER_TEMP/local-commits.md"
+            printf '\n\n## Initial fork release baseline\n\n'
+            cat "$RUNNER_TEMP/baseline.md"
+            printf '\n\n## Persistent fork features\n\n'
+            cat "$RUNNER_TEMP/features.md"
+            printf '\n\nPackage ID: `app.lawnchair`. This APK uses the signing key configured for this fork.\n'
+            if [[ "$UPSTREAM_PRERELEASE" == 'true' ]]; then printf '\nThis is based on an upstream prerelease. In Obtainium, enable prerelease updates for this source to receive it.\n'; fi
+          } > "$RUNNER_TEMP/release-notes.md"
+          if [[ "$RELEASE_EXISTS" == 'true' ]]; then
+            gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/lawnchair-fork.apk" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            args=("$RELEASE_TAG" "$RUNNER_TEMP/lawnchair-fork.apk" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Lawnchair $VERSION_NAME (default-student fork)" --notes-file "$RUNNER_TEMP/release-notes.md")
+            if [[ "$UPSTREAM_PRERELEASE" == 'true' ]]; then args+=(--prerelease); fi
+            gh release create "${args[@]}"
           fi

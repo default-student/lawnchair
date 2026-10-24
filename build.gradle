@@ -360,6 +360,22 @@ composeCompiler {
 
 addFrameworkJar('framework-15.jar')
 
+// Apply fork-only release metadata separately from upstream's version
+// declarations so routine upstream version bumps remain clean three-way merges.
+android {
+    defaultConfig {
+        def forkVersionName = System.getenv("LAWNCHAIR_FORK_VERSION_NAME")
+        if (forkVersionName) {
+            versionName forkVersionName
+            buildConfigField "String", "VERSION_DISPLAY_NAME", "\"${forkVersionName}\""
+        }
+        def forkVersionCode = System.getenv("LAWNCHAIR_FORK_VERSION_CODE")
+        if (forkVersionCode) {
+            versionCode forkVersionCode.toInteger()
+        }
+    }
+}
+
 dependencies {
     implementation projects.iconloaderlib
     implementation projects.searchuilib

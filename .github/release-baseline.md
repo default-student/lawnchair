@@ -1,0 +1,1 @@
+The initial customized source is based on Lawnchair `v15.0.0-beta3.0` and includes fork-specific Private Space features. It remains on the versioned upstream beta line; upstream prerelease releases are published as prereleases for update clients that include prerelease builds.

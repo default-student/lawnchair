@@ -1,0 +1,2 @@
+- Allow selected Private Space apps to appear on the home screen from the owner profile.
+- Provide an owner-profile helper for opening private ChatGPT project links.
