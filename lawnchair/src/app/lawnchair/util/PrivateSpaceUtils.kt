@@ -1,11 +1,13 @@
 package app.lawnchair.util
 
 import android.content.Context
-import android.widget.Toast
 import android.os.UserHandle
 import android.os.UserManager
+import android.widget.Toast
 import app.lawnchair.LawnchairApp
 import app.lawnchair.preferences2.PreferenceManager2
+import com.android.launcher3.R
+import com.android.launcher3.logging.FileLog
 import com.android.launcher3.model.data.CollectionInfo
 import com.android.launcher3.model.data.ItemInfo
 import com.android.launcher3.model.data.ItemInfoWithIcon
@@ -13,8 +15,6 @@ import com.android.launcher3.pm.UserCache
 import com.android.launcher3.util.ApiWrapper
 import com.android.launcher3.util.Executors
 import com.android.launcher3.util.PrivateProfileTracker
-import com.android.launcher3.R
-import com.android.launcher3.logging.FileLog
 import com.patrykmichalik.opto.core.firstBlocking
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -88,8 +88,13 @@ object PrivateSpaceUtils {
      * again, relocating if its cell has since been taken, when the space is unlocked.
      */
     @JvmStatic
-    fun shouldSkipWorkspaceBinding(context: Context, info: ItemInfo?): Boolean =
-        isHiddenWhileLocked(context, info)
+    fun shouldSkipWorkspaceBinding(context: Context, info: ItemInfo?): Boolean {
+        // Allow on home screen is already an explicit choice to reveal these apps' names and
+        // icons. Keep their workspace shortcuts bound while locked; the quiet-profile disabled
+        // flag still routes a tap through the system unlock flow in ItemClickHandler. App drawer
+        // and search continue to use isHiddenWhileLocked() and therefore remain hidden.
+        return isHiddenWhileLocked(context, info) && !isPinningAllowed(context)
+    }
 
     /**
      * Whether [info] must not be surfaced anywhere at all right now.
@@ -175,5 +180,4 @@ object PrivateSpaceUtils {
         if (flags and ItemInfoWithIcon.FLAG_DISABLED_QUIET_USER == 0) return false
         return isPrivateSpaceItem(context, info)
     }
-
 }

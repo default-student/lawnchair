@@ -90,6 +90,9 @@ class ModelLauncherCallbacks(private var taskExecutor: Consumer<ModelUpdateTask>
         user: UserHandle
     ) {
         taskExecutor.accept(ShortcutsChangedTask(packageName, shortcuts, user, true))
+        if (packageName == PrivateShareShortcutTask.PUBLISHER_PACKAGE) {
+            taskExecutor.accept(PrivateShareShortcutTask(shortcuts, user))
+        }
     }
 
     fun onPackagesRemoved(user: UserHandle, packages: List<String>) {

@@ -3,13 +3,13 @@ package app.lawnchair.backup
 import android.annotation.SuppressLint
 import android.app.WallpaperManager
 import android.content.Context
+import android.database.sqlite.SQLiteDatabase
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
-import androidx.core.graphics.drawable.toBitmap
-import android.database.sqlite.SQLiteDatabase
 import android.os.Build
 import android.util.Log
+import androidx.core.graphics.drawable.toBitmap
 import app.lawnchair.LawnchairProto.BackupInfo
 import app.lawnchair.util.PrivateSpaceUtils
 import app.lawnchair.util.hasFlag

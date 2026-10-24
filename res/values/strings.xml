@@ -80,6 +80,8 @@
     <string name="add_item_request_drag_hint">Touch &amp; hold the widget to move it around the home screen</string>
     <!-- Button label to automatically add a widget to home screen [CHAR_LIMIT=50] -->
     <string name="add_to_home_screen">Add to home screen</string>
+    <string name="private_share_title_hint">Project name</string>
+    <string name="private_share_title_required">Enter a project name</string>
     <!-- Accessibility spoken message announced when a widget gets added to the home screen using a
          button in a dialog. [CHAR_LIMIT=none] -->
     <string name="added_to_home_screen_accessibility_text"><xliff:g id="widget_name" example="Calendar month view">%1$s</xliff:g> widget added to home screen</string>

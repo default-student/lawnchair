@@ -26,12 +26,16 @@ import static com.android.launcher3.util.Executors.MODEL_EXECUTOR;
 import static com.android.launcher3.widget.WidgetSections.NO_CATEGORY;
 
 import android.annotation.TargetApi;
+import android.app.Activity;
 import android.appwidget.AppWidgetManager;
 import android.appwidget.AppWidgetProviderInfo;
 import android.content.ClipData;
 import android.content.ClipDescription;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
+import android.content.pm.LauncherActivityInfo;
+import android.content.pm.LauncherApps;
 import android.content.pm.LauncherApps.PinItemRequest;
 import android.content.pm.ShortcutInfo;
 import android.content.res.Configuration;
@@ -42,6 +46,8 @@ import android.graphics.Rect;
 import android.os.AsyncTask;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.UserHandle;
+import android.util.Pair;
 import android.text.TextUtils;
 import android.view.MotionEvent;
 import android.view.View;
@@ -52,6 +58,7 @@ import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityManager;
 import android.widget.TextView;
+import android.widget.EditText;
 
 import androidx.annotation.Nullable;
 
@@ -61,13 +68,21 @@ import com.android.launcher3.Launcher;
 import com.android.launcher3.LauncherAppState;
 import com.android.launcher3.R;
 import com.android.launcher3.logging.StatsLogManager;
+import com.android.launcher3.logging.FileLog;
 import com.android.launcher3.model.ItemInstallQueue;
+import com.android.launcher3.model.PrivateShareShortcutTask;
 import com.android.launcher3.model.WidgetItem;
 import com.android.launcher3.model.WidgetsModel;
+import com.android.launcher3.model.data.WorkspaceItemInfo;
 import com.android.launcher3.model.data.ItemInfo;
+import com.android.launcher3.model.data.AppInfo;
 import com.android.launcher3.model.data.PackageItemInfo;
 import com.android.launcher3.pm.PinRequestHelper;
+import com.android.launcher3.pm.ShortcutConfigActivityInfo.ShortcutConfigActivityInfoVO;
+import com.android.launcher3.pm.UserCache;
+import com.android.launcher3.dragndrop.BaseItemDragListener;
 import com.android.launcher3.util.ApiWrapper;
+import com.android.launcher3.util.ComponentKey;
 import com.android.launcher3.util.PackageManagerHelper;
 import com.android.launcher3.util.SystemUiController;
 import com.android.launcher3.views.AbstractSlideInView;
@@ -78,13 +93,16 @@ import com.android.launcher3.widget.LauncherWidgetHolder;
 import com.android.launcher3.widget.NavigableAppWidgetHostView;
 import com.android.launcher3.widget.PendingAddShortcutInfo;
 import com.android.launcher3.widget.PendingAddWidgetInfo;
+import com.android.launcher3.widget.PendingItemDragHelper;
 import com.android.launcher3.widget.WidgetCell;
 import com.android.launcher3.widget.WidgetCellPreview;
 import com.android.launcher3.widget.WidgetImageView;
 import com.android.launcher3.widget.WidgetManagerHelper;
 import com.android.launcher3.widget.WidgetSections;
+import app.lawnchair.preferences.PreferenceManager;
 
 import java.util.function.Supplier;
+import java.util.Collections;
 
 /**
  * Activity to show pin widget dialog.
@@ -102,6 +120,14 @@ public class AddItemActivity extends BaseActivity
     private final PointF mLastTouchPos = new PointF();
 
     private PinItemRequest mRequest;
+    private boolean mPrivateShareMode;
+    private String mPrivateShareId;
+    private String mPrivateShareLoadFailureReason;
+    private UserHandle mPrivateShareUser;
+    private LauncherActivityInfo mPrivateShareAlias;
+    private PrivateShareConfigActivityInfo mPrivateShareConfigActivityInfo;
+    private EditText mPrivateShareTitleInput;
+    private boolean mPrivateShareTitleRequired;
     private LauncherAppState mApp;
     private InvariantDeviceProfile mIdp;
     private BaseDragLayer<AddItemActivity> mDragLayer;
@@ -124,7 +150,14 @@ public class AddItemActivity extends BaseActivity
         super.onCreate(savedInstanceState);
 
         mRequest = PinRequestHelper.getPinItemRequest(getIntent());
-        if (mRequest == null) {
+        mPrivateShareMode = getIntent().getBooleanExtra(
+                PrivateShareShortcutTask.EXTRA_MODE, false);
+        if (mRequest == null && !mPrivateShareMode) {
+            finish();
+            return;
+        }
+
+        if (mPrivateShareMode && !loadPrivateShareRequest()) {
             finish();
             return;
         }
@@ -148,16 +181,20 @@ public class AddItemActivity extends BaseActivity
                 getApplicationContext().getSystemService(AccessibilityManager.class);
 
         final PackageItemInfo targetApp;
-        switch (mRequest.getRequestType()) {
-            case PinItemRequest.REQUEST_TYPE_SHORTCUT:
-                targetApp = setupShortcut();
-                break;
-            case PinItemRequest.REQUEST_TYPE_APPWIDGET:
-                targetApp = setupWidget();
-                break;
-            default:
-                targetApp = null;
-                break;
+        if (mPrivateShareMode) {
+            targetApp = setupPrivateShareShortcut();
+        } else {
+            switch (mRequest.getRequestType()) {
+                case PinItemRequest.REQUEST_TYPE_SHORTCUT:
+                    targetApp = setupShortcut();
+                    break;
+                case PinItemRequest.REQUEST_TYPE_APPWIDGET:
+                    targetApp = setupWidget();
+                    break;
+                default:
+                    targetApp = null;
+                    break;
+            }
         }
         if (targetApp == null) {
             // TODO: show error toast?
@@ -187,8 +224,18 @@ public class AddItemActivity extends BaseActivity
         TextView widgetAppName = findViewById(R.id.widget_appName);
         WidgetSections.WidgetSection section = targetApp.widgetCategory == NO_CATEGORY ? null
                 : WidgetSections.getWidgetSections(this).get(targetApp.widgetCategory);
-        widgetAppName.setText(section == null ? info.loadLabel(getPackageManager())
-                : getString(section.mSectionTitle));
+        if (mPrivateShareMode) {
+            mPrivateShareTitleInput = (EditText) widgetAppName;
+            mPrivateShareTitleInput.setVisibility(View.VISIBLE);
+            mPrivateShareTitleInput.setHint(R.string.private_share_title_hint);
+            mPrivateShareTitleInput.setText(mPrivateShareTitleRequired ? ""
+                    : mPrivateShareConfigActivityInfo.getTitle());
+            mPrivateShareTitleInput.setSelection(mPrivateShareTitleInput.length());
+        } else {
+            widgetAppName.setVisibility(View.VISIBLE);
+            widgetAppName.setText(section == null ? info.loadLabel(getPackageManager())
+                    : getString(section.mSectionTitle));
+        }
 
         mSlideInView = findViewById(R.id.add_item_bottom_sheet);
         mSlideInView.addOnCloseListener(this);
@@ -216,8 +263,24 @@ public class AddItemActivity extends BaseActivity
 
         final Rect bounds;
         // Start home and pass the draw request params
-        final PinItemDragListener listener;
-        if (appWidgetHostView != null) {
+        final BaseItemDragListener listener;
+        if (mPrivateShareMode) {
+            if (mPrivateShareConfigActivityInfo == null || img.getDrawable() == null) {
+                return false;
+            }
+            String title = getPrivateShareTitle();
+            if (title == null) {
+                mPrivateShareTitleInput.setError(getString(R.string.private_share_title_required));
+                return false;
+            }
+            bounds = img.getBitmapBounds();
+            bounds.offset(img.getLeft() - (int) mLastTouchPos.x,
+                    img.getTop() - (int) mLastTouchPos.y);
+            PendingAddShortcutInfo pendingInfo = new PendingAddShortcutInfo(
+                    mPrivateShareConfigActivityInfo.withTitle(title));
+            listener = new PrivateShareDragListener(pendingInfo, bounds,
+                    img.getDrawable().getIntrinsicWidth(), img.getWidth());
+        } else if (appWidgetHostView != null) {
             bounds = new Rect();
             appWidgetHostView.getSourceVisualDragBounds(bounds);
             float appWidgetHostViewScale = mWidgetCell.getAppWidgetHostViewScale();
@@ -286,6 +349,58 @@ public class AddItemActivity extends BaseActivity
                 mRequest.getShortcutInfo().getUserHandle());
     }
 
+    private boolean loadPrivateShareRequest() {
+        mPrivateShareId = getIntent().getStringExtra(PrivateShareShortcutTask.EXTRA_ID);
+        long serial = getIntent().getLongExtra(
+                PrivateShareShortcutTask.EXTRA_USER_SERIAL, -1);
+        if (serial < 0) {
+            mPrivateShareLoadFailureReason = "missing private profile serial";
+            return false;
+        }
+        UserCache userCache = UserCache.INSTANCE.get(this);
+        mPrivateShareUser = userCache.getUserForSerialNumber(serial);
+        if (userCache.getSerialNumberForUser(mPrivateShareUser) != serial) {
+            mPrivateShareLoadFailureReason = "private profile no longer resolves";
+            return false;
+        }
+        if (!PrivateShareShortcutTask.isAllowed(this, mPrivateShareUser)) {
+            mPrivateShareLoadFailureReason = "private profile is locked or home pinning is disabled";
+            return false;
+        }
+        ShortcutInfo shortcut = PrivateShareShortcutTask.findPendingShortcut(
+                this, mPrivateShareUser, mPrivateShareId);
+        if (shortcut == null) {
+            mPrivateShareLoadFailureReason = "published shortcut marker is unavailable";
+            return false;
+        }
+        mPrivateShareAlias = PrivateShareShortcutTask.findAlias(
+                getSystemService(LauncherApps.class), mPrivateShareUser, shortcut);
+        if (mPrivateShareAlias == null) {
+            mPrivateShareLoadFailureReason = "enabled launcher alias is unavailable";
+            return false;
+        }
+        mPrivateShareTitleRequired = shortcut.getExtras() != null
+                && shortcut.getExtras().getBoolean(
+                        PrivateShareShortcutTask.EXTRA_TITLE_REQUIRED, false);
+        mPrivateShareLoadFailureReason = null;
+        return true;
+    }
+
+    private PackageItemInfo setupPrivateShareShortcut() {
+        mPrivateShareConfigActivityInfo = new PrivateShareConfigActivityInfo(
+                getApplicationContext(), mPrivateShareAlias, mPrivateShareId,
+                mPrivateShareUser, UserCache.INSTANCE.get(this)
+                        .getSerialNumberForUser(mPrivateShareUser),
+                mPrivateShareTitleRequired ? "" : mPrivateShareTitleFromShortcut());
+        mWidgetCell.getWidgetView().setTag(new PendingAddShortcutInfo(
+                mPrivateShareConfigActivityInfo));
+        applyWidgetItemAsync(() -> new WidgetItem(mPrivateShareConfigActivityInfo,
+                mApp.getIconCache(),
+                getPackageManager()));
+        return new PackageItemInfo(PrivateShareShortcutTask.PUBLISHER_PACKAGE,
+                mPrivateShareUser);
+    }
+
     private PackageItemInfo setupWidget() {
         final LauncherAppWidgetProviderInfo widgetInfo = LauncherAppWidgetProviderInfo
                 .fromProviderInfo(this, mRequest.getAppWidgetProviderInfo(this));
@@ -338,6 +453,44 @@ public class AddItemActivity extends BaseActivity
      * Called when place-automatically button is clicked.
      */
     public void onPlaceAutomaticallyClick(View v) {
+        if (mPrivateShareMode) {
+            if (!loadPrivateShareRequest()) {
+                FileLog.w("AddItemActivity", "Private project shortcut revalidation failed: "
+                        + mPrivateShareLoadFailureReason);
+                android.widget.Toast.makeText(this,
+                        "Private project shortcut unavailable: "
+                                + mPrivateShareLoadFailureReason,
+                        android.widget.Toast.LENGTH_LONG).show();
+                return;
+            }
+            String title = getPrivateShareTitle();
+            if (title == null) {
+                mPrivateShareTitleInput.setError(getString(R.string.private_share_title_required));
+                return;
+            }
+            String stage = "create profile app item";
+            try {
+                AppInfo appInfo = new AppInfo(this, mPrivateShareAlias, mPrivateShareUser);
+                appInfo.title = title;
+                stage = "save custom title";
+                persistPrivateShareTitle(this, mPrivateShareAlias, title);
+                stage = "queue item for workspace";
+                mApp.getModel().addAndBindAddedWorkspaceItems(Collections.singletonList(
+                        Pair.create((ItemInfo) appInfo, (Object) null)));
+                stage = "send accessibility event";
+                logCommand(LAUNCHER_ADD_EXTERNAL_ITEM_PLACED_AUTOMATICALLY);
+                sendWidgetAddedToScreenAccessibilityEvent(title);
+                mSlideInView.close(/* animate= */ true);
+            } catch (RuntimeException e) {
+                FileLog.e("AddItemActivity", "Could not add private project shortcut at stage: "
+                        + stage, e);
+                android.widget.Toast.makeText(this,
+                        "Lawnchair could not add this project shortcut ("
+                                + e.getClass().getSimpleName() + ").",
+                        android.widget.Toast.LENGTH_LONG).show();
+            }
+            return;
+        }
         if (mRequest.getRequestType() == PinItemRequest.REQUEST_TYPE_SHORTCUT) {
             ShortcutInfo shortcutInfo = mRequest.getShortcutInfo();
             ItemInstallQueue.INSTANCE.get(this).queueItem(shortcutInfo);
@@ -365,6 +518,29 @@ public class AddItemActivity extends BaseActivity
         // request bind widget
         mAppWidgetHolder.startBindFlow(this, mPendingBindWidgetId,
                 mRequest.getAppWidgetProviderInfo(this), REQUEST_BIND_APPWIDGET);
+    }
+
+    private String mPrivateShareTitleFromShortcut() {
+        ShortcutInfo shortcut = PrivateShareShortcutTask.findPendingShortcut(
+                this, mPrivateShareUser, mPrivateShareId);
+        return shortcut == null || TextUtils.isEmpty(shortcut.getShortLabel())
+                ? "" : shortcut.getShortLabel().toString();
+    }
+
+    private String getPrivateShareTitle() {
+        if (mPrivateShareTitleInput == null) {
+            return null;
+        }
+        String title = mPrivateShareTitleInput.getText().toString().trim();
+        return title.isEmpty() ? null : title;
+    }
+
+    private static void persistPrivateShareTitle(Context context, LauncherActivityInfo alias,
+            String title) {
+        ComponentKey key = new ComponentKey(alias.getComponentName(), alias.getUser());
+        PreferenceManager.getInstance(context).getCustomAppName().set(key, title);
+        LauncherAppState.getInstance(context).getModel().onAppIconChanged(
+                alias.getComponentName().getPackageName(), alias.getUser());
     }
 
     private void acceptWidget(int widgetId) {
@@ -455,6 +631,89 @@ public class AddItemActivity extends BaseActivity
         getStatsLogManager().logger()
                 .withItemInfo((ItemInfo) mWidgetCell.getWidgetView().getTag())
                 .log(command);
+    }
+
+    private static final class PrivateShareConfigActivityInfo extends ShortcutConfigActivityInfoVO {
+
+        private final Context mContext;
+        private final String mShortcutId;
+        private final long mUserSerial;
+        private final UserHandle mProfile;
+        private final LauncherActivityInfo mAlias;
+        private final String mTitle;
+
+        PrivateShareConfigActivityInfo(Context context, LauncherActivityInfo alias,
+                String shortcutId, UserHandle profile, long userSerial, String title) {
+            super(alias);
+            mContext = context.getApplicationContext();
+            mShortcutId = shortcutId;
+            mProfile = profile;
+            mUserSerial = userSerial;
+            mAlias = alias;
+            mTitle = title;
+        }
+
+        String getTitle() {
+            return mTitle;
+        }
+
+        PrivateShareConfigActivityInfo withTitle(String title) {
+            return new PrivateShareConfigActivityInfo(mContext, mAlias,
+                    mShortcutId, mProfile, mUserSerial, title);
+        }
+
+        @Override
+        public WorkspaceItemInfo createWorkspaceItemInfo() {
+            UserCache userCache = UserCache.INSTANCE.get(mContext);
+            UserHandle profile = userCache.getUserForSerialNumber(mUserSerial);
+            if (!mProfile.equals(profile)
+                    || userCache.getSerialNumberForUser(profile) != mUserSerial
+                    || !PrivateShareShortcutTask.isAllowed(mContext, profile)) {
+                return null;
+            }
+            ShortcutInfo marker = PrivateShareShortcutTask.findPendingShortcut(
+                    mContext, profile, mShortcutId);
+            if (marker == null) {
+                return null;
+            }
+            LauncherActivityInfo alias = PrivateShareShortcutTask.findAlias(
+                    mContext.getSystemService(LauncherApps.class), profile, marker);
+            if (alias == null || !getComponent().equals(alias.getComponentName())) {
+                return null;
+            }
+
+            AppInfo appInfo = new AppInfo(mContext, alias, profile);
+            LauncherAppState app = LauncherAppState.getInstance(mContext);
+            app.getIconCache().getTitleAndIcon(appInfo, alias, false /* useLowResIcon */);
+            appInfo.title = mTitle;
+            persistPrivateShareTitle(mContext, alias, mTitle);
+            return appInfo.makeWorkspaceItem(mContext);
+        }
+
+        @Override
+        public boolean startConfigActivity(Activity activity, int requestCode) {
+            android.widget.Toast.makeText(activity, R.string.activity_not_found,
+                    android.widget.Toast.LENGTH_SHORT).show();
+            return false;
+        }
+    }
+
+    private static final class PrivateShareDragListener extends BaseItemDragListener {
+
+        private final PendingAddShortcutInfo mPendingInfo;
+
+        PrivateShareDragListener(PendingAddShortcutInfo pendingInfo, Rect previewRect,
+                int previewBitmapWidth, int previewViewWidth) {
+            super(previewRect, previewBitmapWidth, previewViewWidth);
+            mPendingInfo = pendingInfo;
+        }
+
+        @Override
+        protected PendingItemDragHelper createDragHelper() {
+            View dragSource = new View(mLauncher);
+            dragSource.setTag(mPendingInfo);
+            return new PendingItemDragHelper(dragSource);
+        }
     }
 
     @Override

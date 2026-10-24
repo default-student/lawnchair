@@ -1,0 +1,166 @@
+name: Fork APK release
+
+on:
+  push:
+    branches: [private-space-release]
+
+permissions: {}
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    outputs:
+      source_sha: ${{ steps.sync.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: private-space-release
+          fetch-depth: 0
+      - name: Merge Lawnchair 15 beta upstream
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/LawnchairLauncher/lawnchair.git
+          git fetch upstream 15-beta
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git merge --no-edit FETCH_HEAD; then
+            git merge --abort || true
+            title="Lawnchair upstream sync conflict"
+            exists=$(gh issue list --state open --json title --jq 'map(.title) | index("'"$title"'") != null')
+            if [ "$exists" != "true" ]; then
+              gh issue create --title "$title" --body "The automated merge from LawnchairLauncher/lawnchair 15-beta conflicted. No APK was built or published. Resolve the conflict on branch private-space-release, then push a new commit to retry. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            fi
+            exit 1
+          fi
+          if ! git diff --quiet "origin/private-space-release" HEAD; then
+            git push origin HEAD:private-space-release
+          fi
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build-unsigned:
+    needs: sync-upstream
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.sync-upstream.outputs.source_sha }}
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00
+        with:
+          distribution: zulu
+          java-version: 21
+      - name: Build unsigned GitHub release APK
+        env:
+          LAWNCHAIR_UNSIGNED_RELEASE: "true"
+        run: ./gradlew --no-daemon assembleLawnWithQuickstepGithubRelease
+      - name: Verify the APK is unsigned and is the GitHub flavor
+        run: |
+          set -euo pipefail
+          apk=$(find build/outputs/apk/lawnWithQuickstepGithub/release -maxdepth 1 -name '*.apk' -print -quit)
+          test -n "$apk"
+          if apksigner verify "$apk" >/dev/null 2>&1; then
+            echo "The build job produced a signed APK" >&2
+            exit 1
+          fi
+          app_id=$(apkanalyzer manifest application-id "$apk")
+          test "$app_id" = "app.lawnchair"
+          mkdir -p "$RUNNER_TEMP/release"
+          cp "$apk" "$RUNNER_TEMP/release/lawnchair-github-unsigned.apk"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: lawnchair-unsigned
+          path: ${{ runner.temp }}/release/lawnchair-github-unsigned.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-apk:
+    needs: [sync-upstream, build-unsigned]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: lawnchair-unsigned
+          path: ${{ runner.temp }}/unsigned
+      - name: Sign and verify the APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.LAWNCHAIR_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.LAWNCHAIR_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.LAWNCHAIR_KEY_PASSWORD }}
+          KEY_ALIAS: lawnchair-release
+        run: |
+          set -euo pipefail
+          apk=$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)
+          apkanalyzer=$(find "$ANDROID_HOME" -type f -name apkanalyzer -print -quit)
+          test -x "$apk"
+          test -x "$apkanalyzer"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/lawnchair-release.jks"
+          chmod 600 "$RUNNER_TEMP/lawnchair-release.jks"
+          "$apk" sign --ks "$RUNNER_TEMP/lawnchair-release.jks" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:KEYSTORE_PASSWORD --key-pass env:KEY_PASSWORD \
+            --out "$RUNNER_TEMP/lawnchair-github.apk" \
+            "$RUNNER_TEMP/unsigned/lawnchair-github-unsigned.apk"
+          "$apk" verify --verbose --print-certs "$RUNNER_TEMP/lawnchair-github.apk"
+          app_id=$("$apkanalyzer" manifest application-id "$RUNNER_TEMP/lawnchair-github.apk")
+          test "$app_id" = "app.lawnchair"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: lawnchair-signed
+          path: ${{ runner.temp }}/lawnchair-github.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release:
+    needs: [sync-upstream, sign-apk]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: lawnchair-signed
+          path: ${{ runner.temp }}/release
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.sync-upstream.outputs.source_sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          short_sha=${SOURCE_SHA:0:7}
+          tag="lawnchair-15beta-private-${short_sha}-${RUN_NUMBER}"
+          title="Lawnchair GitHub release with Private Space changes (${short_sha})"
+          gh release create "$tag" "$RUNNER_TEMP/release/lawnchair-github.apk" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "$title" \
+            --notes "Lawnchair GitHub flavor, Release build. Includes the Private Space changes from this fork. Package ID: app.lawnchair. Source commit: ${SOURCE_SHA}."
+
+  notify-failure:
+    if: always() && contains(join(needs.*.result, ','), 'failure')
+    needs: [sync-upstream, build-unsigned, sign-apk, publish-release]
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open a failure issue without exposing secrets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="Lawnchair APK release workflow failed"
+          exists=$(gh issue list --state open --json title --jq 'map(.title) | index("'"$title"'") != null')
+          if [ "$exists" != "true" ]; then
+            gh issue create --title "$title" --body "The unsigned build, signing verification, upstream sync, or release publication failed. No signing credentials are included in this issue. Inspect the failed run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          fi
