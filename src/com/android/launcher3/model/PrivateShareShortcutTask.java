@@ -175,4 +175,31 @@ public class PrivateShareShortcutTask implements ModelUpdateTask {
         }
         return null;
     }
+
+    /**
+     * Returns the name stored in the private-space marker for an alias. The launcher keeps its
+     * own custom-name preference too, but this marker is the source of truth for recovering a
+     * label when that preference is missing or was written by an older launcher build.
+     */
+    public static CharSequence findPublishedTitle(Context context, UserHandle user,
+            android.content.ComponentName alias) {
+        if (alias == null || !PUBLISHER_PACKAGE.equals(alias.getPackageName())
+                || !alias.getClassName().startsWith(PUBLISHER_PACKAGE + ".ProjectLink")) {
+            return null;
+        }
+        List<ShortcutInfo> shortcuts = new ShortcutRequest(context, user)
+                .forPackage(PUBLISHER_PACKAGE)
+                .withContainer(alias)
+                .query(ShortcutRequest.PUBLISHED);
+        for (ShortcutInfo shortcut : shortcuts) {
+            if (!isCandidate(shortcut) || !alias.equals(shortcut.getActivity())) {
+                continue;
+            }
+            CharSequence title = shortcut.getShortLabel();
+            if (!TextUtils.isEmpty(title)) {
+                return title;
+            }
+        }
+        return null;
+    }
 }

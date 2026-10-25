@@ -214,7 +214,23 @@ android {
 
     def releaseSigning
     if (System.getenv("LAWNCHAIR_UNSIGNED_RELEASE") != "true") {
-        try {
+        def envStoreFile = System.getenv("LAWNCHAIR_SIGNING_KEYSTORE")
+        def envKeyAlias = System.getenv("LAWNCHAIR_SIGNING_KEY_ALIAS")
+        def envStorePassword = System.getenv("LAWNCHAIR_SIGNING_STORE_PASSWORD")
+        def envKeyPassword = System.getenv("LAWNCHAIR_SIGNING_KEY_PASSWORD")
+        boolean anyEnvironmentSigningValue = envStoreFile || envKeyAlias
+                || envStorePassword || envKeyPassword
+        if (anyEnvironmentSigningValue) {
+            if (!envStoreFile || !envKeyAlias || !envStorePassword || !envKeyPassword) {
+                throw new GradleException("All LAWNCHAIR_SIGNING_* variables are required")
+            }
+            releaseSigning = signingConfigs.create("release") {
+                keyAlias envKeyAlias
+                keyPassword envKeyPassword
+                storeFile file(envStoreFile)
+                storePassword envStorePassword
+            }
+        } else try {
             def keystoreProperties = new Properties()
             keystoreProperties.load(rootProject.file("keystore.properties").newInputStream())
             releaseSigning = signingConfigs.create("release") {
