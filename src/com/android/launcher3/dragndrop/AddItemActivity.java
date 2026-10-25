@@ -22,6 +22,7 @@ import static com.android.launcher3.logging.StatsLogManager.LauncherEvent.LAUNCH
 import static com.android.launcher3.logging.StatsLogManager.LauncherEvent.LAUNCHER_ADD_EXTERNAL_ITEM_DRAGGED;
 import static com.android.launcher3.logging.StatsLogManager.LauncherEvent.LAUNCHER_ADD_EXTERNAL_ITEM_PLACED_AUTOMATICALLY;
 import static com.android.launcher3.logging.StatsLogManager.LauncherEvent.LAUNCHER_ADD_EXTERNAL_ITEM_START;
+import static com.android.launcher3.util.Executors.MAIN_EXECUTOR;
 import static com.android.launcher3.util.Executors.MODEL_EXECUTOR;
 import static com.android.launcher3.widget.WidgetSections.NO_CATEGORY;
 
@@ -43,9 +44,11 @@ import android.graphics.Canvas;
 import android.graphics.Point;
 import android.graphics.PointF;
 import android.graphics.Rect;
+import android.graphics.drawable.Drawable;
 import android.os.AsyncTask;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Looper;
 import android.os.UserHandle;
 import android.util.Pair;
 import android.text.TextUtils;
@@ -67,8 +70,11 @@ import com.android.launcher3.InvariantDeviceProfile;
 import com.android.launcher3.Launcher;
 import com.android.launcher3.LauncherAppState;
 import com.android.launcher3.R;
-import com.android.launcher3.logging.StatsLogManager;
+import com.android.launcher3.icons.BaseIconFactory;
+import com.android.launcher3.icons.LauncherIcons;
+import com.android.launcher3.icons.ShortcutCachingLogic;
 import com.android.launcher3.logging.FileLog;
+import com.android.launcher3.logging.StatsLogManager;
 import com.android.launcher3.model.ItemInstallQueue;
 import com.android.launcher3.model.PrivateShareShortcutTask;
 import com.android.launcher3.model.WidgetItem;
@@ -468,27 +474,39 @@ public class AddItemActivity extends BaseActivity
                 mPrivateShareTitleInput.setError(getString(R.string.private_share_title_required));
                 return;
             }
-            String stage = "create profile app item";
+            AppInfo appInfo;
+            ShortcutInfo marker = PrivateShareShortcutTask.findPendingShortcut(
+                    this, mPrivateShareUser, mPrivateShareId);
+            if (marker == null) {
+                android.widget.Toast.makeText(this,
+                        "Private project shortcut unavailable: published marker is missing.",
+                        android.widget.Toast.LENGTH_LONG).show();
+                return;
+            }
             try {
-                AppInfo appInfo = new AppInfo(this, mPrivateShareAlias, mPrivateShareUser);
-                appInfo.title = title;
-                stage = "save custom title";
-                persistPrivateShareTitle(this, mPrivateShareAlias, title);
-                stage = "queue item for workspace";
-                mApp.getModel().addAndBindAddedWorkspaceItems(Collections.singletonList(
-                        Pair.create((ItemInfo) appInfo, (Object) null)));
-                stage = "send accessibility event";
-                logCommand(LAUNCHER_ADD_EXTERNAL_ITEM_PLACED_AUTOMATICALLY);
-                sendWidgetAddedToScreenAccessibilityEvent(title);
-                mSlideInView.close(/* animate= */ true);
+                appInfo = new AppInfo(this, mPrivateShareAlias, mPrivateShareUser);
             } catch (RuntimeException e) {
-                FileLog.e("AddItemActivity", "Could not add private project shortcut at stage: "
-                        + stage, e);
+                FileLog.e("AddItemActivity", "Could not create private project app item", e);
                 android.widget.Toast.makeText(this,
                         "Lawnchair could not add this project shortcut ("
                                 + e.getClass().getSimpleName() + ").",
                         android.widget.Toast.LENGTH_LONG).show();
+                return;
             }
+            v.setEnabled(false);
+            AppInfo item = appInfo;
+            LauncherActivityInfo alias = mPrivateShareAlias;
+            MODEL_EXECUTOR.execute(() -> {
+                try {
+                    mApp.getIconCache().getTitleAndIcon(item, alias, false /* useLowResIcon */);
+                    mApp.getIconCache().getShortcutIcon(item, marker);
+                } catch (RuntimeException e) {
+                    FileLog.e("AddItemActivity",
+                            "Could not load private project shortcut icon", e);
+                }
+                item.title = title;
+                MAIN_EXECUTOR.execute(() -> finishPrivateSharePlacement(item, alias, title, v));
+            });
             return;
         }
         if (mRequest.getRequestType() == PinItemRequest.REQUEST_TYPE_SHORTCUT) {
@@ -518,6 +536,29 @@ public class AddItemActivity extends BaseActivity
         // request bind widget
         mAppWidgetHolder.startBindFlow(this, mPendingBindWidgetId,
                 mRequest.getAppWidgetProviderInfo(this), REQUEST_BIND_APPWIDGET);
+    }
+
+    private void finishPrivateSharePlacement(AppInfo appInfo, LauncherActivityInfo alias,
+            String title, View trigger) {
+        String stage = "save custom title";
+        try {
+            persistPrivateShareTitle(this, alias, title);
+            stage = "queue item for workspace";
+            mApp.getModel().addAndBindAddedWorkspaceItems(Collections.singletonList(
+                    Pair.create((ItemInfo) appInfo, (Object) null)));
+            stage = "send accessibility event";
+            logCommand(LAUNCHER_ADD_EXTERNAL_ITEM_PLACED_AUTOMATICALLY);
+            sendWidgetAddedToScreenAccessibilityEvent(title);
+            mSlideInView.close(/* animate= */ true);
+        } catch (RuntimeException e) {
+            trigger.setEnabled(true);
+            FileLog.e("AddItemActivity", "Could not add private project shortcut at stage: "
+                    + stage, e);
+            android.widget.Toast.makeText(this,
+                    "Lawnchair could not add this project shortcut ("
+                            + e.getClass().getSimpleName() + ").",
+                    android.widget.Toast.LENGTH_LONG).show();
+        }
     }
 
     private String mPrivateShareTitleFromShortcut() {
@@ -684,7 +725,20 @@ public class AddItemActivity extends BaseActivity
 
             AppInfo appInfo = new AppInfo(mContext, alias, profile);
             LauncherAppState app = LauncherAppState.getInstance(mContext);
-            app.getIconCache().getTitleAndIcon(appInfo, alias, false /* useLowResIcon */);
+            if (Looper.myLooper() == MODEL_EXECUTOR.getHandler().getLooper()) {
+                app.getIconCache().getTitleAndIcon(appInfo, alias, false /* useLowResIcon */);
+                app.getIconCache().getShortcutIcon(appInfo, marker);
+            } else {
+                int density = LauncherAppState.getIDP(mContext).fillResIconDpi;
+                Drawable icon = ShortcutCachingLogic.getIcon(mContext, marker, density);
+                if (icon == null) icon = alias.getIcon(density);
+                if (icon != null) {
+                    try (LauncherIcons icons = LauncherIcons.obtain(mContext)) {
+                        appInfo.bitmap = icons.createBadgedIconBitmap(icon,
+                                new BaseIconFactory.IconOptions().setUser(profile));
+                    }
+                }
+            }
             appInfo.title = mTitle;
             persistPrivateShareTitle(mContext, alias, mTitle);
             return appInfo.makeWorkspaceItem(mContext);

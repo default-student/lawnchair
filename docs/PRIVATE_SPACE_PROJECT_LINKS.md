@@ -29,7 +29,9 @@ of source files, issue reports, screenshots, and build logs.
   record and validates the marker, profile, and enabled activity alias.
 - Reused Lawnchair's native add-item confirmation. The user can enter or edit
   the project name before adding it. Confirming creates a normal app item for
-  the exact private activity alias through the launcher model.
+  the exact private activity alias through the launcher model, using the
+  selected target app's shortcut icon. Existing home items keep their current
+  icon until removed and added again.
 - Added drag-and-drop support for the same confirmation flow. The marker and
   alias are checked again at drop time; invalid drops are rejected.
 - Deduplicated repeated callbacks using bounded launcher-private preferences.
