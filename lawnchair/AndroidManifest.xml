@@ -80,6 +80,17 @@
             android:theme="@style/Theme.Transparent" />
 
         <activity
+            android:name="app.lawnchair.shortcuts.PrivateSpaceShortcutConfigActivity"
+            android:exported="true"
+            android:label="@string/private_space_shortcut"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.intent.action.CREATE_SHORTCUT" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <activity
             android:name="app.lawnchair.smartspace.SmartspacePreferencesShortcut"
             android:theme="@style/Theme.Transparent" />
 

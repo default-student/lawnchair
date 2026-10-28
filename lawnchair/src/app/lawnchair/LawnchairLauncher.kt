@@ -47,9 +47,11 @@ import app.lawnchair.preferences.PreferenceManager
 import app.lawnchair.preferences2.PreferenceManager2
 import app.lawnchair.root.RootHelperManager
 import app.lawnchair.root.RootNotAvailableException
+import app.lawnchair.shortcuts.PrivateSpaceShortcut
 import app.lawnchair.theme.ThemeProvider
 import app.lawnchair.ui.popup.LauncherOptionsPopup
 import app.lawnchair.ui.popup.LawnchairShortcut
+import app.lawnchair.util.PrivateSpaceUtils
 import app.lawnchair.util.getThemedIconPacksInstalled
 import app.lawnchair.util.unsafeLazy
 import app.lawnchair.views.LawnchairFloatingSurfaceView
@@ -252,6 +254,24 @@ class LawnchairLauncher : QuickstepLauncher() {
         reloadIconsIfNeeded()
 
         AppDatabase.INSTANCE.get(this).checkpointSync()
+        togglePrivateSpaceIfRequested(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        val togglePrivateSpace = intent.action == PrivateSpaceShortcut.ACTION_TOGGLE
+        super.onNewIntent(
+            if (togglePrivateSpace) Intent(intent).setAction(Intent.ACTION_MAIN) else intent,
+        )
+        if (togglePrivateSpace) {
+            setIntent(Intent(Intent.ACTION_MAIN))
+            togglePrivateSpaceIfRequested(intent)
+        }
+    }
+
+    private fun togglePrivateSpaceIfRequested(intent: Intent?) {
+        if (intent?.action == PrivateSpaceShortcut.ACTION_TOGGLE) {
+            PrivateSpaceUtils.togglePrivateSpace(this)
+        }
     }
 
     override fun collectStateHandlers(out: MutableList<StateHandler<LauncherState>>) {

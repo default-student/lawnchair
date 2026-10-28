@@ -156,6 +156,28 @@ object PrivateSpaceUtils {
         }
     }
 
+    /** Toggles Private Space through the system quiet-mode API. */
+    @JvmStatic
+    fun togglePrivateSpace(context: Context) {
+        Executors.UI_HELPER_EXECUTOR.post {
+            val userCache = UserCache.getInstance(context)
+            val privateUser = userCache.userProfiles.firstOrNull {
+                userCache.getUserInfo(it).isPrivate
+            } ?: return@post
+            try {
+                val userManager = context.getSystemService(UserManager::class.java) ?: return@post
+                userManager.requestQuietModeEnabled(
+                    !userManager.isQuietModeEnabled(privateUser),
+                    privateUser,
+                )
+            } catch (e: SecurityException) {
+                Executors.MAIN_EXECUTOR.execute {
+                    ApiWrapper.INSTANCE.get(context).assignDefaultHomeRole(context)
+                }
+            }
+        }
+    }
+
     /** Whether [info] belongs to the private profile. */
     @JvmStatic
     fun isPrivateSpaceItem(context: Context, info: ItemInfo?): Boolean {

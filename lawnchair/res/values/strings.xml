@@ -646,6 +646,7 @@
     <string name="color_dark">Dark</string>
 
     <string name="private_space_group_label">Private space</string>
+    <string name="private_space_shortcut">Private Space</string>
     <string name="private_space_check_failed">Couldn\'t check private space state — some icons may be shown or hidden incorrectly</string>
     <string name="private_space_pinning_label">Allow on home screen</string>
     <string name="private_space_pinning_description">Let private space apps be added to the home screen and dock. Their names and icons will be visible outside the private space</string>
